@@ -21,10 +21,22 @@ var saveZoomLevelPort;
 var isEnabledForUrl = true;
 // The user's operating system.
 var currentCompletionKeys;
+var validFirstKeys;
 var linkHintCss;
 
 // TODO(philc): This should be pulled from the extension's storage when the page loads.
 var currentZoomLevel = 100;
+
+// The types in <input type="..."> that we consider for focusInput command. Right now this is recalculated in
+// each content script. Alternatively we could calculate it once in the background page and use a request to
+// fetch it each time.
+//
+// Should we include the HTML5 date pickers here?
+var textInputTypes = ["text", "search", "email", "url", "number"];
+// The corresponding XPath for such elements.
+var textInputXPath = '//input[' +
+                     textInputTypes.map(function (type) { return '@type="' + type + '"'; }).join(" or ") +
+                     ' or not(@type)]';
 
 /*
  * Give this frame a unique id.
@@ -32,6 +44,7 @@ var currentZoomLevel = 100;
 frameId = Math.floor(Math.random()*999999999)
 
 var hasModifiersRegex = /^<([amc]-)+.>/;
+var googleRegex = /:\/\/[^/]*google[^/]+/;
 
 function getSetting(key) {
   if (!settingPort)
@@ -50,7 +63,8 @@ function initializePreDomReady() {
   checkIfEnabledForUrl();
 
   var getZoomLevelPort = chrome.extension.connect({ name: "getZoomLevel" });
-  getZoomLevelPort.postMessage({ domain: window.location.host });
+  if (window.self == window.parent)
+    getZoomLevelPort.postMessage({ domain: window.location.host });
 
   chrome.extension.sendRequest({handler: "getLinkHintCss"}, function (response) {
     linkHintCss = response.linkHintCss;
@@ -62,20 +76,21 @@ function initializePreDomReady() {
   keyPort = chrome.extension.connect({ name: "keyDown" });
 
   chrome.extension.onRequest.addListener(function(request, sender, sendResponse) {
-    if (request.name == "hideUpgradeNotification")
+    if (request.name == "hideUpgradeNotification") {
       HUD.hideUpgradeNotification();
-    else if (request.name == "showUpgradeNotification" && isEnabledForUrl)
+    } else if (request.name == "showUpgradeNotification" && isEnabledForUrl) {
       HUD.showUpgradeNotification(request.version);
-    else if (request.name == "showHelpDialog")
+    } else if (request.name == "showHelpDialog") {
       if (isShowingHelpDialog)
         hideHelpDialog();
       else
         showHelpDialog(request.dialogHtml, request.frameId);
-    else if (request.name == "focusFrame")
-      if(frameId == request.frameId)
+    } else if (request.name == "focusFrame") {
+      if (frameId == request.frameId)
         focusThisFrame(request.highlight);
-    else if (request.name == "refreshCompletionKeys")
-      refreshCompletionKeys(request.completionKeys);
+    } else if (request.name == "refreshCompletionKeys") {
+      refreshCompletionKeys(request);
+    }
     sendResponse({}); // Free up the resources used by this open connection.
   });
 
@@ -90,7 +105,7 @@ function initializePreDomReady() {
           }
         }
 
-        refreshCompletionKeys(args.completionKeys);
+        refreshCompletionKeys(args);
       });
     }
     else if (port.name == "getScrollPosition") {
@@ -118,10 +133,6 @@ function initializePreDomReady() {
       });
     } else if (port.name == "returnSetting") {
       port.onMessage.addListener(setSetting);
-    } else if (port.name == "refreshCompletionKeys") {
-      port.onMessage.addListener(function (args) {
-        refreshCompletionKeys(args.completionKeys);
-      });
     }
   });
 }
@@ -141,8 +152,8 @@ function initializeWhenEnabled() {
 /*
  * The backend needs to know which frame has focus.
  */
-window.addEventListener("focus", function(e){
-  chrome.extension.sendRequest({handler: "frameFocused", frameId: frameId});
+window.addEventListener("focus", function(e) {
+  chrome.extension.sendRequest({ handler: "frameFocused", frameId: frameId });
 });
 
 /*
@@ -173,7 +184,8 @@ function initializeOnDomReady() {
 // This is a little hacky but sometimes the size wasn't available on domReady?
 function registerFrameIfSizeAvailable (top) {
   if (innerWidth != undefined && innerWidth != 0 && innerHeight != undefined && innerHeight != 0)
-    chrome.extension.sendRequest({ handler: "registerFrame", frameId: frameId, area: innerWidth * innerHeight, top: top, total: frames.length + 1 });
+    chrome.extension.sendRequest({ handler: "registerFrame", frameId: frameId,
+        area: innerWidth * innerHeight, top: top, total: frames.length + 1 });
   else
     setTimeout(function () { registerFrameIfSizeAvailable(top); }, 100);
 }
@@ -209,12 +221,22 @@ function setPageZoomLevel(zoomLevel, showUINotification) {
 }
 
 function zoomIn() {
-  setPageZoomLevel(currentZoomLevel += 20, true);
-  saveZoomLevel(window.location.host, currentZoomLevel);
+  currentZoomLevel += 20;
+  setAndSaveZoom();
 }
 
 function zoomOut() {
-  setPageZoomLevel(currentZoomLevel -= 20, true);
+  currentZoomLevel -= 20;
+  setAndSaveZoom();
+}
+
+function zoomReset() {
+  currentZoomLevel = 100;
+  setAndSaveZoom();
+}
+
+function setAndSaveZoom() {
+  setPageZoomLevel(currentZoomLevel, true);
   saveZoomLevel(window.location.host, currentZoomLevel);
 }
 
@@ -232,8 +254,8 @@ function scrollLeft() { window.scrollBy(-1 * settings["scrollStepSize"], 0); }
 function scrollRight() { window.scrollBy(settings["scrollStepSize"], 0); }
 
 function focusInput(count) {
-  var xpath = '//input[@type="text" or @type="search"]';
-  var results = document.evaluate(xpath, document.documentElement, null,
+  var results = document.evaluate(textInputXPath,
+                                  document.documentElement, null,
                                   XPathResult.ORDERED_NODE_ITERATOR_TYPE, null);
 
   var lastInputBox;
@@ -255,7 +277,7 @@ function reload() { window.location.reload(); }
 function goBack() { history.back(); }
 function goForward() { history.forward(); }
 
-function goUp() {
+function goUp(count) {
   var url = window.location.href;
   if (url[url.length-1] == '/')
     url = url.substring(0, url.length - 1);
@@ -263,7 +285,7 @@ function goUp() {
   var urlsplit = url.split('/');
   // make sure we haven't hit the base domain yet
   if (urlsplit.length > 3) {
-    delete urlsplit[urlsplit.length-1];
+    urlsplit = urlsplit.slice(0, Math.max(3, urlsplit.length - count));
     window.location.href = urlsplit.join('/');
   }
 }
@@ -293,7 +315,7 @@ function toggleViewSourceCallback(url) {
     url = url.substr(12, url.length - 12);
   }
   else { url = "view-source:" + url; }
-  chrome.extension.sendRequest({handler: "openUrlInCurrentTab", url:url});
+  chrome.extension.sendRequest({handler: "openUrlInNewTab", url: url, selected: true});
 }
 
 /**
@@ -378,8 +400,8 @@ function onKeydown(event) {
       exitInsertMode();
 
       // Added to prevent Google Instant from reclaiming the keystroke and putting us back into the search box.
-      // TOOD(ilya): Revisit this. Not sure it's the absolute best approach.
-      event.stopPropagation();
+      if (isGoogleSearch())
+        event.stopPropagation();
     }
   }
   else if (findMode)
@@ -420,7 +442,8 @@ function onKeydown(event) {
   // Subject to internationalization issues since we're using keyIdentifier instead of charCode (in keypress).
   //
   // TOOD(ilya): Revisit this. Not sure it's the absolute best approach.
-  if (keyChar == "" && !insertMode && currentCompletionKeys.indexOf(getKeyChar(event)) != -1)
+  if (keyChar == "" && !insertMode
+                    && (currentCompletionKeys.indexOf(getKeyChar(event)) != -1 || validFirstKeys[getKeyChar(event)]))
     event.stopPropagation();
 }
 
@@ -437,13 +460,21 @@ function checkIfEnabledForUrl() {
     });
 }
 
-function refreshCompletionKeys(completionKeys) {
-  if (completionKeys)
-    currentCompletionKeys = completionKeys;
-  else
-    chrome.extension.sendRequest({handler: "getCompletionKeys"}, function (response) {
-      currentCompletionKeys = response.completionKeys;
-    });
+// TODO(ilya): This just checks if "google" is in the domain name. Probably should be more targeted.
+function isGoogleSearch() {
+  var url = window.location.toString();
+  return !!url.match(googleRegex);
+}
+
+function refreshCompletionKeys(response) {
+  if (response) {
+    currentCompletionKeys = response.completionKeys;
+
+    if (response.validFirstKeys)
+      validFirstKeys = response.validFirstKeys;
+  } else {
+    chrome.extension.sendRequest({ handler: "getCompletionKeys" }, refreshCompletionKeys);
+  }
 }
 
 function onFocusCapturePhase(event) {
@@ -539,6 +570,45 @@ function performBackwardsFind() {
   findModeQueryHasResults = window.find(findModeQuery, false, true, true, false, true, false);
 }
 
+function findAndFollowLink(linkStrings) {
+  for (i = 0; i < linkStrings.length; i++) {
+    var findModeQueryHasResults = window.find(linkStrings[i], false, true, true, false, true, false);
+    if (findModeQueryHasResults) {
+      var node = window.getSelection().anchorNode;
+      while (node.nodeName != 'BODY') {
+        if (node.nodeName == 'A') {
+          window.location = node.href;
+          return true;
+        }
+        node = node.parentNode;
+      }
+    }
+  }
+}
+
+function findAndFollowRel(value) {
+  var relTags = ['link', 'a', 'area'];
+  for (i = 0; i < relTags.length; i++) {
+    var elements = document.getElementsByTagName(relTags[i]);
+    for (j = 0; j < elements.length; j++) {
+      if (elements[j].hasAttribute('rel') && elements[j].rel == value) {
+        window.location = elements[j].href;
+        return true;
+      }
+    }
+  }
+}
+
+function goPrevious() {
+  var previousStrings = ["\bprev\b","\bprevious\b","\u00AB","<<","<"];
+  findAndFollowRel('prev') || findAndFollowLink(previousStrings);
+}
+
+function goNext() {
+  var nextStrings = ["\bnext\b","\u00BB",">>","\bmore\b",">"];
+  findAndFollowRel('next') || findAndFollowLink(nextStrings);
+}
+
 function showFindModeHUDForQuery() {
   if (findModeQueryHasResults || findModeQuery.length == 0)
     HUD.show("/" + insertSpaces(findModeQuery));
@@ -580,17 +650,17 @@ function showHelpDialog(html, fid) {
   isShowingHelpDialog = true;
   var container = document.createElement("div");
   container.id = "vimiumHelpDialogContainer";
+
+  document.body.appendChild(container);
+
   container.innerHTML = html;
+  // This is necessary because innerHTML does not evaluate javascript embedded in <script> tags.
+  var scripts = Array.prototype.slice.call(container.getElementsByTagName("script"));
+  scripts.forEach(function(script) { eval(script.text); });
+
   container.getElementsByClassName("closeButton")[0].addEventListener("click", hideHelpDialog, false);
   container.getElementsByClassName("optionsPage")[0].addEventListener("click",
       function() { chrome.extension.sendRequest({ handler: "openOptionsPageInNewTab" }); }, false);
-
-  document.body.appendChild(container);
-  var dialog = document.getElementById("vimiumHelpDialog");
-  dialog.style.zIndex = "99999998";
-  var zoomFactor = currentZoomLevel / 100.0;
-  dialog.style.top =
-      Math.max((window.innerHeight - dialog.clientHeight * zoomFactor) / 2.0, 20) / zoomFactor + "px";
 }
 
 function hideHelpDialog(clickEvent) {
@@ -625,6 +695,7 @@ HUD = {
       "bottom: 0px;" +
       "color: black;" +
       "height: 13px;" +
+      "width: auto;" +
       "max-width: 400px;" +
       "min-width: 150px;" +
       "text-align: left;" +
@@ -787,8 +858,8 @@ Tween = {
 function addCssToPage(css) {
   var head = document.getElementsByTagName("head")[0];
   if (!head) {
-    console.log("Warning: unable to add CSS to the page.");
-    return;
+    head = document.createElement("head");
+    document.documentElement.appendChild(head);
   }
   var style = document.createElement("style");
   style.type = "text/css";

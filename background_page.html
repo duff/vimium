@@ -18,9 +18,10 @@
   var focusedFrame = null;
   var framesForTab = {};
 
-  // Keys are either literal characters, or "named" - for example <a-b> (alt+b), <left> (the left arrow) or <f12>
-  // This regular expression captures two groups, the first is a named key, the second is the remainder of the string.
-  var namedKeyRegex = /^(<[amc-].|(?:[amc]-)?[a-z0-9]{2,5}>)(.*)$/;
+  // Keys are either literal characters, or "named" - for example <a-b> (alt+b), <left> (left arrow) or <f12>
+  // This regular expression captures two groups: the first is a named key, the second is the remainder of
+  // the string.
+  var namedKeyRegex = /^(<(?:[amc]-.|(?:[amc]-)?[a-z0-9]{2,5})>)(.*)$/;
 
   var defaultSettings = {
     scrollStepSize: 60,
@@ -28,7 +29,9 @@
     linkHintCharacters: "sadfjklewcmpgh",
     userDefinedLinkHintCss:
       ".vimiumHintMarker {\n\n}\n" +
-      ".vimiumHintMarker > .matchingCharacter {\n\n}"
+      ".vimiumHintMarker > .matchingCharacter {\n\n}",
+    excludedUrls: "http*://mail.google.com/*\n" +
+                  "http*://www.google.com/reader/*\n"
   };
 
   // This is the base internal link hints CSS. It's combined with the userDefinedLinkHintCss before
@@ -66,8 +69,9 @@
   };
 
   var sendRequestHandlers = {
-    getCompletionKeys: getCompletionKeys,
+    getCompletionKeys: getCompletionKeysRequest,
     getLinkHintCss: getLinkHintCss,
+    openUrlInNewTab: openUrlInNewTab,
     openUrlInCurrentTab: openUrlInCurrentTab,
     openOptionsPageInNewTab: openOptionsPageInNewTab,
     registerFrame: registerFrame,
@@ -75,7 +79,8 @@
     upgradeNotificationClosed: upgradeNotificationClosed,
     updateScrollPosition: handleUpdateScrollPosition,
     copyToClipboard: copyToClipboard,
-    isEnabledForUrl: isEnabledForUrl
+    isEnabledForUrl: isEnabledForUrl,
+    saveHelpDialogSettings: saveHelpDialogSettings
   };
 
   // Event handlers
@@ -136,7 +141,7 @@
    */
   function isEnabledForUrl(request) {
     // excludedUrls are stored as a series of URL expressions separated by newlines.
-    var excludedUrls = (localStorage["excludedUrls"] || "").split("\n");
+    var excludedUrls = getSettingFromLocalStorage("excludedUrls").split("\n");
     var isEnabled = true;
     for (var i = 0; i < excludedUrls.length; i++) {
       // The user can add "*" to the URL which means ".*"
@@ -147,6 +152,10 @@
     return { isEnabledForUrl: isEnabled };
   }
 
+  function saveHelpDialogSettings(request) {
+    localStorage["helpDialog_showAdvancedCommands"] = request.showAdvancedCommands;
+  }
+
   /*
    * Returns the previously saved zoom level for the current tab, or the default zoom level
    */
@@ -154,14 +163,14 @@
     var returnPort = chrome.tabs.connect(port.tab.id, { name: "returnZoomLevel" });
     var localStorageKey = "zoom" + args.domain;
     var zoomLevelForDomain = (localStorage[localStorageKey] || "").split(",")[1];
-    var zoomLevel = parseInt(zoomLevelForDomain || localStorage["defaultZoomLevel"] ||
-        defaultSettings.defaultZoomLevel);
+    var zoomLevel = parseInt(zoomLevelForDomain || getSettingFromLocalStorage("defaultZoomLevel"));
     returnPort.postMessage({ zoomLevel: zoomLevel });
   }
 
   function showHelp(callback, frameId) {
     chrome.tabs.getSelected(null, function(tab) {
-      chrome.tabs.sendRequest(tab.id, { name: "showHelpDialog", dialogHtml: helpDialogHtml(), frameId:frameId });
+      chrome.tabs.sendRequest(tab.id,
+        { name: "showHelpDialog", dialogHtml: helpDialogHtml(), frameId:frameId });
     });
   }
 
@@ -181,6 +190,8 @@
                                         showUnboundCommands, showCommandNames));
     dialogHtml = dialogHtml.replace("{{version}}", currentVersion);
     dialogHtml = dialogHtml.replace("{{title}}", customTitle || "Help");
+    dialogHtml = dialogHtml.replace("{{showAdvancedCommands}}",
+        localStorage["helpDialog_showAdvancedCommands"] == "true");
     return dialogHtml;
   }
 
@@ -192,11 +203,12 @@
     var html = [];
     for (var i = 0; i < commandGroups[group].length; i++) {
       var command = commandGroups[group][i];
-      bindings = (commandsToKey[command] || [""]).join(", ")
-      if (showUnboundCommands || commandsToKey[command])
-      {
-        html.push("<tr><td>", escapeHtml(bindings),
-          "</td><td>:</td><td>", availableCommands[command].description);
+      bindings = (commandsToKey[command] || [""]).join(", ");
+      if (showUnboundCommands || commandsToKey[command]) {
+        html.push(
+          "<tr class='" + (advancedCommands.indexOf(command) >= 0 ? "advanced" : "") + "'>",
+          "<td>", escapeHtml(bindings), "</td>",
+          "<td>:</td><td>", availableCommands[command].description);
 
         if (showCommandNames)
           html.push("<span class='commandName'>(" + command + ")</span>");
@@ -222,8 +234,11 @@
   /**
    * Returns the keys that can complete a valid command given the current key queue.
    */
-  function getCompletionKeys(request) {
-    return {completionKeys: generateCompletionKeys()};
+  function getCompletionKeysRequest(request) {
+    return { name: "refreshCompletionKeys",
+             completionKeys: generateCompletionKeys(),
+             validFirstKeys: validFirstKeys
+           };
   }
 
   /**
@@ -235,6 +250,15 @@
      });
    }
 
+  /**
+   * Opens request.url in new tab and switches to it if request.selected is true.
+   *
+   */
+  function openUrlInNewTab(request) {
+    chrome.tabs.getSelected(null, function(tab) {
+      chrome.tabs.create({ url: request.url, index: tab.index + 1, selected: request.selected });
+    });
+  }
   /*
    * Returns the core CSS used for link hints, along with any user-provided overrides.
    */
@@ -262,10 +286,20 @@
    * Used by the content scripts to get settings from the local storage.
    */
   function getSetting(args, port) {
-    var value = localStorage[args.key] ? localStorage[args.key] : defaultSettings[args.key];
-
+    var value = getSettingFromLocalStorage(args.key);
     var returnPort = chrome.tabs.connect(port.tab.id, { name: "returnSetting" });
     returnPort.postMessage({ key: args.key, value: value });
+  }
+
+  /*
+   * Used by everyone to get settings from local storage.
+   */
+  function getSettingFromLocalStorage(setting) {
+    if (localStorage[setting] != "" && !localStorage[setting]) {
+      return defaultSettings[setting];
+    } else {
+      return localStorage[setting];
+    }
   }
 
   /*
@@ -469,7 +503,7 @@
     populateValidFirstKeys();
     populateSingleKeyCommands();
 
-    sendRequestToAllTabs({ name: "refreshCompletionKeys", completionKeys: generateCompletionKeys() });
+    sendRequestToAllTabs(getCompletionKeysRequest());
   }
 
   /*
@@ -550,7 +584,7 @@
 
       // The second key might be a valid command by its self.
       if (keyToCommandRegistry[splitKey.second])
-        newKeyQueue = checkKeyQueue(splitKey.second);
+        newKeyQueue = checkKeyQueue(splitKey.second, tabId, frameId);
       else
         newKeyQueue = (validFirstKeys[splitKey.second] ? splitKey.second : "");
     } else {
@@ -559,10 +593,8 @@
 
     // If we haven't sent the completion keys piggybacked on executePageCommand,
     // send them by themselves.
-    if (!refreshedCompletionKeys)
-    {
-      var port = chrome.tabs.connect(tabId, { name: "refreshCompletionKeys" });
-      port.postMessage({ completionKeys: generateCompletionKeys(newKeyQueue) });
+    if (!refreshedCompletionKeys) {
+      chrome.tabs.sendRequest(tabId, getCompletionKeysRequest(), null);
     }
 
     return newKeyQueue;
@@ -672,6 +704,21 @@
 
     if (localStorage["keyMappings"])
       parseCustomKeyMappings(localStorage["keyMappings"]);
+
+    // In version 1.22, we changed the mapping for "d" and "u" to be scroll page down/up instead of close
+    // and restore tab. For existing users, we want to preserve existing behavior for them by adding some
+    // custom key mappings on their behalf.
+    if (localStorage.previousVersion == "1.21") {
+      var customKeyMappings = localStorage["keyMappings"] || "";
+      if ((keyToCommandRegistry["d"] || {}).command == "scrollPageDown")
+        customKeyMappings += "\nmap d removeTab";
+      if ((keyToCommandRegistry["u"] || {}).command == "scrollPageUp")
+        customKeyMappings += "\nmap u restoreTab";
+      if (customKeyMappings != "") {
+        localStorage["keyMappings"] = customKeyMappings;
+        parseCustomKeyMappings(customKeyMappings);
+      }
+    }
 
     populateValidFirstKeys();
     populateSingleKeyCommands();
